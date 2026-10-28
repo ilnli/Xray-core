@@ -6,19 +6,9 @@ name: Scheduled assets update
 #       - Geodat (GeoIP/Geosite)
 #       - Wintun (wintun.dll)
 
+# Dependency fork: packaging is handled by ilnli/v2node.
 on:
   workflow_dispatch:
-  schedule:
-    # Update GeoData on every day (22:30 UTC)
-    - cron: "30 22 * * *"
-  push:
-    # Prevent triggering update request storm
-    paths:
-      - ".github/workflows/scheduled-assets-update.yml"
-  pull_request:
-    # Prevent triggering update request storm
-    paths:
-      - ".github/workflows/scheduled-assets-update.yml"
 
 jobs:
   geodat:
@@ -40,7 +30,7 @@ jobs:
           max_attempts: 60
           command: |
             [ -d 'resources' ] || mkdir resources
-            LIST=('Loyalsoldier v2ray-rules-dat geoip geoip' 'Loyalsoldier v2ray-rules-dat geosite geosite')
+            LIST=('XTLS Xray-rules-dat geoip/geoip-lite geoip' 'XTLS Xray-rules-dat geosite/geosite geosite')
             for i in "${LIST[@]}"
             do
               INFO=($(echo $i | awk 'BEGIN{FS=" ";OFS=" "} {print $1,$2,$3,$4}'))

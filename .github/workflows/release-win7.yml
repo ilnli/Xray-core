@@ -1,12 +1,8 @@
 name: Build and Release for Windows 7
 
+# Dependency fork: packaging is handled by ilnli/v2node.
 on:
   workflow_dispatch:
-  release:
-    types: [published]
-  push:
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 jobs:
   check-assets:

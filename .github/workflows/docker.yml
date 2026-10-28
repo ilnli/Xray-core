@@ -1,11 +1,7 @@
 name: Build and Push Docker Image
 
+# Dependency fork: packaging is handled by ilnli/v2node.
 on:
-  release:
-    types:
-      - published
-      - released
-
   workflow_dispatch:
     inputs:
       tag:
