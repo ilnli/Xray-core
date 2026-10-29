@@ -6,6 +6,8 @@ Initial synchronization merges official `v26.10.21` (`1b1647cd9ddf0abc34b981d461
 
 The official Vision compatibility fix for Go 1.27.3+ is included. Builds and CI use Go 1.27.3. Keep the original module path `github.com/xtls/xray-core`; proxynode pins this repository with a Go module replacement.
 
+Current synchronization (2026-10-29) merges official `v26.10.29` (`0afec66085a85191e9dd2a4a6646c7c9a94688d1`). Fork protocol extensions remain unchanged. The only merge conflict was the test workflow: retain the fork's pinned Go/geodata compatibility checks rather than reintroducing upstream asset-cache jobs and repository-wide generated-code normalization. Runtime changes and the upstream protobuf tooling are included.
+
 ## Future synchronization
 
 Fetch official release tags from `https://github.com/XTLS/Xray-core`, merge a reviewed release into this fork, and resolve actual conflicts without discarding fork-only protocols. Do not automatically merge moving upstream main. Run the fork compatibility checks and the real Mihomo/proxynode suite in `ilnli/v2node` before advancing its dependency pin or publishing proxynode binaries. Pin immutable commit IDs and record the tested Mihomo version and checksum.
