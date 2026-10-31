@@ -256,6 +256,10 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	if h.usesDialerProxy {
+		// Descendant dialers connect to intermediary peers, not an observed final target.
+		ctx = session.ContextWithEgressObserver(ctx, nil)
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() {
@@ -270,6 +274,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	destination := ob.Target
+	requested := destination
 	origTargetAddr := ob.OriginalTarget.Address
 	if origTargetAddr == nil {
 		origTargetAddr = ob.Target.Address
@@ -350,9 +355,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return nil
 	})
 	if err != nil {
+		if !h.usesDialerProxy {
+			session.ReportEgress(ctx, session.EgressEvent{Destination: destination, Requested: requested, Outcome: "failed"})
+		}
 		return errors.New("failed to open connection to ", destination).Base(err)
 	}
 	if blockedDest != nil {
+		session.ReportEgress(ctx, session.EgressEvent{Destination: *blockedDest, Requested: requested, Outcome: "blocked"})
 		return h.blackhole(ctx, input, output, blockedRule, blockedDest)
 	}
 	if destination.Address.Family().IsDomain() && (defaultRule != nil || len(h.finalRules) > 0) {
@@ -360,8 +369,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		remoteDest := net.DestinationFromAddr(conn.RemoteAddr())
 		if rule := h.matchFinalRule(remoteDest.Network, remoteDest.Address, remoteDest.Port, defaultRule); rule != nil && rule.action == RuleAction_Block {
 			conn.Close()
+			session.ReportEgress(ctx, session.EgressEvent{Destination: remoteDest, Requested: requested, Outcome: "blocked"})
 			return h.blackhole(ctx, input, output, rule, &remoteDest)
 		}
+	}
+	if !h.usesDialerProxy && destination.Network == net.Network_TCP {
+		session.ReportEgress(ctx, session.EgressEvent{Destination: net.DestinationFromAddr(conn.RemoteAddr()), Requested: requested, Outcome: "allowed"})
 	}
 
 	if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
@@ -392,6 +405,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}, plcy.Timeouts.ConnectionIdle)
 
+	// Timeout-only sessions replace ctx below; retain the session observer.
+	egressCtx := ctx
 	requestDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
 
@@ -408,7 +423,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				writer = buf.NewWriter(conn)
 			}
 		} else {
-			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
+			writer = newPacketWriter(egressCtx, conn, h, defaultRule, UDPOverride, destination, requested, outGateway)
 			if h.config.Noises != nil {
 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
 				writer = &NoisePacketWriter{
@@ -538,6 +553,13 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 // DialDest means the dial target used in the dialer when creating conn
 func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination, outGateway net.Address) buf.Writer {
+	return newPacketWriter(context.Background(), conn, h, defaultRule, UDPOverride, DialDest, DialDest, outGateway)
+}
+
+func newPacketWriter(ctx context.Context, conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest, requested net.Destination, outGateway net.Address) buf.Writer {
+	if h.usesDialerProxy {
+		ctx = session.ContextWithEgressObserver(ctx, nil)
+	}
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
 	if ok {
@@ -555,6 +577,8 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 			resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
 		}
 		return &PacketWriter{
+			Context:           ctx,
+			Requested:         requested,
 			PacketConnWrapper: c,
 			Counter:           counter,
 			Handler:           h,
@@ -564,7 +588,27 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 			OutGateway:        outGateway,
 		}
 	}
-	return &buf.SequentialWriter{Writer: conn}
+	if h.usesDialerProxy {
+		return &buf.SequentialWriter{Writer: conn}
+	}
+	return &buf.SequentialWriter{Writer: &egressPacketWriter{Writer: conn, ctx: ctx, destination: net.DestinationFromAddr(conn.RemoteAddr()), requested: requested}}
+}
+
+type egressPacketWriter struct {
+	io.Writer
+	ctx         context.Context
+	destination net.Destination
+	requested   net.Destination
+}
+
+func (w *egressPacketWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	outcome := "allowed"
+	if err != nil {
+		outcome = "failed"
+	}
+	session.ReportEgress(w.ctx, session.EgressEvent{Destination: w.destination, Requested: w.requested, Outcome: outcome})
+	return n, err
 }
 
 type PacketWriter struct {
@@ -573,6 +617,8 @@ type PacketWriter struct {
 	*Handler
 	DefaultRule *FinalRule
 	UDPOverride net.Destination
+	Context     context.Context
+	Requested   net.Destination
 
 	// Dest of udp packets might be a domain, we will resolve them to IP
 	// But resolver will return a random one if the domain has many IPs
@@ -591,7 +637,10 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 		var n int
 		var err error
+		requested := w.Requested
+		destination := net.DestinationFromAddr(w.PacketConnWrapper.RemoteAddr())
 		if b.UDP != nil {
+			requested = *b.UDP
 			if w.UDPOverride.Address != nil {
 				b.UDP.Address = w.UDPOverride.Address
 			}
@@ -608,6 +657,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 						if err != nil {
 							// drop packet if resolve failed when forceIP
 							if strategy.ForceIP() {
+								w.reportEgress(*b.UDP, requested, "failed")
 								b.Release()
 								continue
 							}
@@ -619,6 +669,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					if shouldUseSystemResolver {
 						udpAddr, err := net.ResolveUDPAddr("udp", b.UDP.NetAddr())
 						if err != nil {
+							w.reportEgress(*b.UDP, requested, "failed")
 							b.Release()
 							continue
 						} else {
@@ -631,28 +682,39 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				}
 			}
 			if rule := w.matchFinalRule(net.Network_UDP, b.UDP.Address, b.UDP.Port, w.DefaultRule); rule != nil && rule.action == RuleAction_Block {
+				w.reportEgress(*b.UDP, requested, "blocked")
 				b.Release()
 				continue
 			}
 			destAddr := b.UDP.RawNetAddr()
 			if destAddr == nil {
+				w.reportEgress(*b.UDP, requested, "failed")
 				b.Release()
 				continue
 			}
 			n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
+			destination = *b.UDP
 		} else {
 			n, err = w.PacketConnWrapper.Write(b.Bytes())
 		}
 		b.Release()
 		if err != nil {
+			w.reportEgress(destination, requested, "failed")
 			buf.ReleaseMulti(mb)
 			return err
 		}
+		w.reportEgress(destination, requested, "allowed")
 		if w.Counter != nil {
 			w.Counter.Add(int64(n))
 		}
 	}
 	return nil
+}
+
+func (w *PacketWriter) reportEgress(destination, requested net.Destination, outcome string) {
+	if w.Context != nil {
+		session.ReportEgress(w.Context, session.EgressEvent{Destination: destination, Requested: requested, Outcome: outcome})
+	}
 }
 
 type NoisePacketWriter struct {
