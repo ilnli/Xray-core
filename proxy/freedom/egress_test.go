@@ -109,7 +109,7 @@ func TestTCPEgressReportsFinalPeerAndBlock(t *testing.T) {
 			h := &Handler{config: &Config{}, policyManager: policy.DefaultManager{}}
 			if outcome == "blocked" {
 				requested.Address = net.ParseAddress("203.0.113.9")
-				h.finalRules = []*FinalRule{{action: RuleAction_Block, network: allNetworks, blockDelay: &Range{}}}
+				h.finalRules = []*FinalRule{{action: RuleAction_Block, network: allNetworks, delay: &Range{}}}
 			}
 			h.usesDialerProxy = outcome == "upstream"
 			var events []session.EgressEvent
